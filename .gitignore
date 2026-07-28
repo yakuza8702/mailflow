@@ -1,3 +1,5 @@
+git-priv-key
+
 # Environment — never commit real secrets
 .env
 *.env.local

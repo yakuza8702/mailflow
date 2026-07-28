@@ -41,6 +41,17 @@ function raceTimeout(promise, ms, label) {
   ]);
 }
 
+function createImapClient(cfg, { label = 'client', onError } = {}) {
+  const client = new ImapFlow(cfg);
+  client.on('error', (err) => {
+    console.error(`IMAP error [${label}]:`, err.message);
+    if (onError) {
+      try { onError(err); } catch (e) { console.error('onError handler threw:', e); }
+    }
+  });
+  return client;
+}
+
 // A per-key counting semaphore: at most `limit` holders per key run concurrently; the rest
 // await FIFO until a holder releases. Used to cap concurrent IMAP backfills per provider
 // host so a user with many accounts on one provider doesn't open a backfill connection for
@@ -1018,7 +1029,9 @@ async function acquirePooledClient(account) {
   if (pool.clients.length < POOL_SIZE) {
     const freshAccount = await ensureFreshToken(account);
     const { resolved, policy } = await resolveAccountHost(freshAccount);
-    const client = new ImapFlow(makeClientCfg(freshAccount, resolved, { policy }));
+    const client = createImapClient(makeClientCfg(freshAccount, resolved, { policy }), {
+      label: `pool-grow:${account.id}`,
+    });
     await Promise.race([
       client.connect(),
       new Promise((_, reject) =>
@@ -1051,7 +1064,9 @@ async function acquirePooledClient(account) {
       try {
         const freshAccount = await ensureFreshToken(account);
         const { resolved, policy } = await resolveAccountHost(freshAccount);
-        const tmp = new ImapFlow(makeClientCfg(freshAccount, resolved, { policy }));
+        const tmp = createImapClient(makeClientCfg(freshAccount, resolved, { policy }), {
+          label: `pool-overflow:${account.id}`,
+        });
         tmp.on('error', (err) => {
           console.error(`IMAP temp client error for account ${account.id}:`, err.message);
         });
@@ -1125,7 +1140,9 @@ async function withFreshClient(account, fn) {
 async function withFreshLogin(account, fn) {
   const fresh = await ensureFreshToken(account);
   const { resolved, policy } = await resolveAccountHost(fresh);
-  const client = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+  const client = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+    label: `fresh-login:${account.id}`,
+  });
   client.on('error', () => {}); // avoid unhandled 'error' on abrupt close
   try {
     await Promise.race([
@@ -1382,7 +1399,9 @@ export class ImapManager {
               // always has a real client to close (no post-timeout connection can escape).
               const fresh = await raceTimeout(ensureFreshToken(account), 15000, 'Staleness token refresh');
               const { resolved, policy } = await raceTimeout(resolveAccountHost(fresh), 15000, 'Staleness host resolve');
-              probe = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+              probe = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+                label: `staleness-probe:${account.id}`,
+              });
               probe.on('error', () => {}); // avoid unhandled 'error' on abrupt close
               missed = await Promise.race([
                 (async () => {
@@ -1701,7 +1720,9 @@ export class ImapManager {
     const { resolved, policy } = await resolveAccountHost(account);
     let client;
     try {
-      client = new ImapFlow(makeClientCfg(account, resolved, { enableIdle: providerProfile(account).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(account).idleKeepaliveMs }));
+      client = createImapClient(makeClientCfg(account, resolved, { enableIdle: providerProfile(account).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(account).idleKeepaliveMs }), {
+        label: `connect:${account.id}`,
+      });
       // Race the connect against a 30-second timeout.
       // client.connect() has no built-in connection timeout — on slow or unresponsive
       // IMAP servers (e.g. purelymail.com during cold starts) it can hang indefinitely,
@@ -1854,7 +1875,9 @@ export class ImapManager {
     try {
       const fresh = await raceTimeout(ensureFreshToken(account), 15000, 'Fresh sync token refresh');
       const { resolved, policy } = await raceTimeout(resolveAccountHost(fresh), 15000, 'Fresh sync host resolve');
-      client = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+      client = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+        label: `fresh-sync:${account.id}`,
+      });
       client.on('error', () => {}); // close() below intentionally aborts timed-out sockets
       await raceTimeout(client.connect(), 30000, 'Fresh sync connect');
       // syncMessages' own CONDSTORE modseq check is the "did anything change?" gate: it returns
@@ -1929,7 +1952,9 @@ export class ImapManager {
               if (!accountResult.rows.length || !accountResult.rows[0].enabled) return null;
               const freshAccount = await ensureFreshToken(accountResult.rows[0]);
               const { resolved, policy } = await resolveAccountHost(freshAccount);
-              pendingClient = new ImapFlow(makeClientCfg(freshAccount, resolved, { enableIdle: providerProfile(freshAccount).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(freshAccount).idleKeepaliveMs }));
+              pendingClient = createImapClient(makeClientCfg(freshAccount, resolved, { enableIdle: providerProfile(freshAccount).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(freshAccount).idleKeepaliveMs }), {
+                label: `reconnect:${account.id}`,
+              });
               await pendingClient.connect();
               return { client: pendingClient, account: freshAccount };
             })(),
@@ -2874,7 +2899,9 @@ export class ImapManager {
       if (!row || !row.enabled) throw new Error('Account deleted or disabled');
       const fresh = await ensureFreshToken(row);
       const { resolved, policy } = await resolveAccountHost(fresh);
-      const newClient = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+      const newClient = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+        label: `backfill:${account.id}`,
+      });
       newClient.on('error', (err) => {
         console.error(`Backfill IMAP error for ${logAccount(account)}:`, err.message);
       });
@@ -3337,7 +3364,9 @@ export class ImapManager {
         if (!row) return;
         const fresh = await ensureFreshToken(row);
         const { resolved, policy } = await resolveAccountHost(fresh);
-        client = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+        client = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+          label: `bulk-flags:${account.id}`,
+        });
         client.on('error', () => {});
         await Promise.race([
           client.connect(),
@@ -3485,7 +3514,9 @@ export class ImapManager {
         if (!row) throw new Error('Account deleted');
         const fresh = await ensureFreshToken(row);
         const { resolved, policy } = await resolveAccountHost(fresh);
-        const c = new ImapFlow(makeClientCfg(fresh, resolved, { policy }));
+        const c = createImapClient(makeClientCfg(fresh, resolved, { policy }), {
+          label: `snippet-index:${account.id}`,
+        });
         c.on('error', err => console.error(`Snippet indexer IMAP error ${logAccount(account)}:`, err.message));
         await Promise.race([
           c.connect(),
